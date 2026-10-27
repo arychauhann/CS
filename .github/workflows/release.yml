@@ -1,0 +1,88 @@
+name: Publish CS Android APK
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Existing tag to build and publish (for example, v1.2.0)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag_name || github.ref }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Create temporary APK signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          key_path="${RUNNER_TEMP}/cs-temporary-signing-key.jks"
+          store_password="$(openssl rand -hex 24)"
+          key_password="$(openssl rand -hex 24)"
+          echo "::add-mask::$store_password"
+          echo "::add-mask::$key_password"
+          keytool -genkeypair \
+            -keystore "$key_path" \
+            -storetype JKS \
+            -storepass "$store_password" \
+            -alias ci-release \
+            -keypass "$key_password" \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Temporary CI Signing, OU=Release, O=CS, C=US"
+          {
+            echo "ANDROID_KEYSTORE_PATH=$key_path"
+            echo "ANDROID_KEYSTORE_PASSWORD=$store_password"
+            echo "ANDROID_KEY_ALIAS=ci-release"
+            echo "ANDROID_KEY_PASSWORD=$key_password"
+          } >> "$GITHUB_ENV"
+
+      - name: Build release APK
+        run: gradle --no-daemon --stacktrace :app:assembleRelease
+
+      - name: Rename release APK
+        run: cp app/build/outputs/apk/release/app-release.apk app/build/outputs/apk/release/cs.apk
+
+      - name: Publish GitHub Release with APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: cs
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          files: app/build/outputs/apk/release/cs.apk
+
+      - name: Remove temporary signing key
+        if: always()
+        shell: bash
+        run: rm -f "${RUNNER_TEMP}/cs-temporary-signing-key.jks"

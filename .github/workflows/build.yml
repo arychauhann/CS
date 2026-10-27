@@ -1,0 +1,114 @@
+name: Build CS Android APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.build_type }} APK
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - build_type: debug
+            gradle_task: assembleDebug
+            apk_path: app/build/outputs/apk/debug/app-debug.apk
+          - build_type: release
+            gradle_task: assembleRelease
+            apk_path: app/build/outputs/apk/release/cs.apk
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      # Debug APKs use Gradle's default debug key; only the release APK uses this temporary key.
+      - name: Create temporary release signing key
+        if: matrix.build_type == 'release'
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          key_path="${RUNNER_TEMP}/cs-temporary-signing-key.jks"
+          store_password="$(openssl rand -hex 24)"
+          key_password="$(openssl rand -hex 24)"
+          echo "::add-mask::$store_password"
+          echo "::add-mask::$key_password"
+          keytool -genkeypair \
+            -keystore "$key_path" \
+            -storetype JKS \
+            -storepass "$store_password" \
+            -alias ci-release \
+            -keypass "$key_password" \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Temporary CI Signing, OU=Build, O=CS, C=US"
+          {
+            echo "ANDROID_KEYSTORE_PATH=$key_path"
+            echo "ANDROID_KEYSTORE_PASSWORD=$store_password"
+            echo "ANDROID_KEY_ALIAS=ci-release"
+            echo "ANDROID_KEY_PASSWORD=$key_password"
+          } >> "$GITHUB_ENV"
+
+      - name: Build ${{ matrix.build_type }} APK
+        run: gradle --no-daemon --stacktrace ":app:${{ matrix.gradle_task }}"
+
+      - name: Rename release APK
+        if: matrix.build_type == 'release'
+        run: cp app/build/outputs/apk/release/app-release.apk app/build/outputs/apk/release/cs.apk
+
+      - name: Upload ${{ matrix.build_type }} APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: CS-Android-${{ matrix.build_type }}-APK
+          path: ${{ matrix.apk_path }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove temporary release signing key
+        if: always() && matrix.build_type == 'release'
+        shell: bash
+        run: rm -f "${RUNNER_TEMP}/cs-temporary-signing-key.jks"
+
+  publish-nightly:
+    name: Publish Nightly Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release APK
+        uses: actions/download-artifact@v4
+        with:
+          name: CS-Android-release-APK
+          path: nightly
+
+      - name: Publish nightly GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: cs-nightly-${{ github.run_number }}
+          name: cs
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          prerelease: true
+          make_latest: false
+          fail_on_unmatched_files: true
+          files: nightly/cs.apk
